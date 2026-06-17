@@ -1,0 +1,12 @@
+# One container serves the API + website on http://localhost:8000
+services:
+  nexora:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nexora-market
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    restart: unless-stopped

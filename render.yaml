@@ -1,0 +1,31 @@
+# Render.com blueprint — one service serves BOTH the API and the website.
+# Deploy: push this repo to GitHub, then "New + → Blueprint" on render.com.
+services:
+  - type: web
+    name: nexora-market
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ENV
+        value: production
+      - key: CORS_ORIGINS
+        value: "*"
+      # Add your provider keys in the Render dashboard (kept out of source):
+      - key: MARKETAUX_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: FMP_API_KEY
+        sync: false
+      - key: ALPHA_VANTAGE_API_KEY
+        sync: false
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
