@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     FMP_API_KEY: str = ""
     ALPHA_VANTAGE_API_KEY: str = ""
     TWELVE_DATA_API_KEY: str = ""
+    NGX_API_KEY: str = ""   # NGX Pulse — Nigerian Exchange data (ngxpulse.ng)
 
     # --- LLM ---
     LLM_API_KEY: str = ""
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
     def provider_status(self) -> dict:
         """Which providers have keys configured."""
         return {
+            "ngx_pulse": bool(self.NGX_API_KEY),
             "marketaux": bool(self.MARKETAUX_API_KEY),
             "finnhub": bool(self.FINNHUB_API_KEY),
             "fmp": bool(self.FMP_API_KEY),

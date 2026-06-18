@@ -20,6 +20,8 @@ services:
       - key: CORS_ORIGINS
         value: "*"
       # Add your provider keys in the Render dashboard (kept out of source):
+      - key: NGX_API_KEY
+        sync: false
       - key: MARKETAUX_API_KEY
         sync: false
       - key: FINNHUB_API_KEY

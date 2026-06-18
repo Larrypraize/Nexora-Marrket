@@ -23,7 +23,12 @@ async def insights():
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """Conversational AI assistant — 'Ask Nexora Anything'."""
+    """Conversational AI assistant — 'Ask Nexora Anything'.
+
+    Detects stocks / market intent in the question, fetches LIVE data, and feeds
+    it to the AI so answers use real numbers (not guesses).
+    """
     history = [{"role": m.role, "content": m.content} for m in req.history]
-    reply, ai_powered = await ai.chat_reply(req.message, history)
-    return ChatResponse(reply=reply, ai_powered=ai_powered)
+    context, related = await market.build_chat_context(req.message)
+    reply, ai_powered = await ai.chat_reply(req.message, history, context=context)
+    return ChatResponse(reply=reply, ai_powered=ai_powered, related_symbols=related)

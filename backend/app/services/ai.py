@@ -149,19 +149,33 @@ async def explain_stock(symbol: str, name: str, change_pct, score, news_sentimen
     return rule_explanation(symbol, name, change_pct, score, news_sentiment), False
 
 
-async def chat_reply(message: str, history: list[dict]) -> tuple[str, bool]:
-    """Conversational assistant. Returns (reply, ai_powered)."""
+async def chat_reply(message: str, history: list[dict],
+                     context: str = "") -> tuple[str, bool]:
+    """Conversational assistant. Returns (reply, ai_powered).
+
+    `context` is live market data (quotes/sentiment/movers) injected by the
+    router so the AI answers with REAL numbers instead of guessing.
+    """
     if settings.llm_enabled:
-        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+        system = SYSTEM_PROMPT
+        if context:
+            system += ("\n\nUse ONLY the following live market data to answer. "
+                       "If the data doesn't contain the answer, say you don't have "
+                       "that figure right now.\n\n=== LIVE MARKET DATA ===\n" + context)
+        msgs = [{"role": "system", "content": system}]
         msgs += [{"role": m["role"], "content": m["content"]} for m in history[-8:]]
         msgs.append({"role": "user", "content": message})
         out = await llm_complete(msgs)
         if out:
             return out, True
-    return _rule_chat(message), False
+    return _rule_chat(message, context), False
 
 
-def _rule_chat(message: str) -> str:
+def _rule_chat(message: str, context: str = "") -> str:
+    # If we have live data context, lead with it (keeps answers accurate).
+    if context:
+        return (context.strip() + "\n\nIn simple terms: this reflects today's "
+                "live market activity. (Educational info only — not financial advice.)")
     m = message.lower()
     if "gtco" in m:
         return ("GTCO is currently attracting strong interest. Buying pressure is "

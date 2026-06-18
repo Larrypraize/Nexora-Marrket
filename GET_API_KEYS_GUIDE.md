@@ -13,7 +13,19 @@ You'll paste these into Render later (see START_HERE_DEPLOY_GUIDE.md, Part E).
 🔐 Keep these keys private — treat them like passwords.
 
 ================================================================
-1) FINNHUB  — stock prices
+0) NGX PULSE  — Nigerian stocks (MOST IMPORTANT for this platform)
+================================================================
+This is what powers all the Nigerian (NGX) stock data — prices, gainers/losers,
+sectors. Get this one first.
+1. Go to:  https://ngxpulse.ng/api
+2. Scroll to the "Request Access" / API key form.
+3. Choose the **Personal / Learning** tier (free, issued instantly).
+4. Enter your email → submit → you receive your **API key**.
+5. Copy it. In your notes file write:  NGX = <paste here>
+   (Free tier = 100 requests/day, which is fine because the app caches data.)
+
+================================================================
+1) FINNHUB  — US stock prices
 ================================================================
 1. Go to:  https://finnhub.io
 2. Click **Get free API key** (or **Sign up**) at the top.
@@ -89,6 +101,7 @@ You should have a notes file like:
 
 Next: open START_HERE_DEPLOY_GUIDE.md → **Part E** and paste each key into the
 matching box on Render:
+    NGX_API_KEY            ← NGX  (Nigerian stocks — most important)
     FINNHUB_API_KEY        ← FINNHUB
     FMP_API_KEY            ← FMP
     ALPHA_VANTAGE_API_KEY  ← ALPHA

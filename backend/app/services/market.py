@@ -17,7 +17,7 @@ from typing import Optional
 from ..cache import cache
 from ..config import settings
 from ..providers import (
-    alpha_vantage, finnhub, fmp, marketaux, mock, twelve_data,
+    alpha_vantage, finnhub, fmp, marketaux, mock, ngx, twelve_data,
 )
 from . import ai
 
@@ -28,6 +28,14 @@ async def get_quote(symbol: str) -> dict:
     key = f"quote:{symbol}"
 
     async def factory():
+        # Nigerian stocks → route to NGX Pulse first.
+        if ngx.is_ngx_symbol(symbol):
+            q = await ngx.quote(symbol)
+            if q:
+                if not q.get("name"):
+                    q["name"] = mock.company_name(symbol)
+                return q
+        # US / global stocks → standard provider chain.
         for fn in (finnhub.quote, twelve_data.quote, fmp.quote, alpha_vantage.quote):
             q = await fn(symbol)
             if q:
@@ -35,6 +43,9 @@ async def get_quote(symbol: str) -> dict:
                 if not q.get("name"):
                     q["name"] = await _resolve_name(symbol) or mock.company_name(symbol)
                 return q
+        # last resort for NGX symbols with no key configured
+        if ngx.is_ngx_symbol(symbol):
+            return mock.mock_quote(symbol)
         return mock.mock_quote(symbol)
 
     return await cache.get_or_set(key, factory, ttl=settings.CACHE_TTL_SECONDS)
@@ -70,20 +81,86 @@ async def get_candles(symbol: str, count: int = 60) -> dict:
 
 
 # ----------------------------------------------------------------- movers
+# Curated universe of liquid, well-covered symbols. When FMP's movers
+# endpoint isn't available (free tier), we fetch real quotes for these and
+# rank them ourselves — giving accurate live data with free keys.
+MOVERS_UNIVERSE = [
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "NFLX",
+    "AMD", "INTC", "COIN", "F", "DIS", "BA", "JPM", "XOM", "CVX",
+    "PFE", "KO", "PEP", "WMT", "NKE", "UBER", "PYPL",
+]
+
+
+async def _ngx_movers(category: str) -> Optional[list]:
+    """Rank NGX equities for a movers category using NGX Pulse's full list."""
+    stocks = await ngx.all_stocks()
+    if not stocks:
+        return None
+    pool = [s for s in stocks if s.get("change_percent") is not None]
+    if not pool:
+        return None
+    if category == "gainers":
+        pool = sorted(pool, key=lambda q: q["change_percent"], reverse=True)
+    elif category == "losers":
+        pool = sorted(pool, key=lambda q: q["change_percent"])
+    elif category == "active":
+        pool = sorted(pool, key=lambda q: q.get("volume") or 0, reverse=True)
+    else:  # trending → biggest absolute moves
+        pool = sorted(pool, key=lambda q: abs(q["change_percent"]), reverse=True)
+    return [{"symbol": q["symbol"], "name": q.get("name"),
+             "price": q.get("price"), "change_percent": q.get("change_percent")}
+            for q in pool[:6]]
+
+
 async def get_movers(category: str) -> dict:
     category = category.lower()
     key = f"movers:{category}"
 
     async def factory():
-        rows = await fmp.movers(category)
-        source = "fmp"
+        # 0) Nigeria-first: use NGX Pulse's full equities list to rank movers.
+        ngx_rows = await _ngx_movers(category)
+        if ngx_rows:
+            rows, source = ngx_rows, "ngx_pulse"
+        else:
+            rows = None
+            source = None
+
+        # 1) Try FMP's dedicated movers endpoint (US, best but often paid).
+        if rows is None:
+            rows = await fmp.movers(category)
+            source = "fmp" if rows else None
+
+        # 2) If unavailable, build real movers from live quotes of our universe.
         if not rows:
-            symbols = mock.mock_movers(category)
-            rows = [{"symbol": s, "name": mock.company_name(s)} for s in symbols]
-            source = "mock"
+            quotes = await asyncio.gather(
+                *[get_quote(s) for s in MOVERS_UNIVERSE], return_exceptions=True
+            )
+            valid = [q for q in quotes
+                     if isinstance(q, dict) and q.get("change_percent") is not None]
+            # only treat as live if we actually got real (non-mock) quotes
+            live = [q for q in valid if q.get("source") != "mock"]
+            if live:
+                pool = live
+                source = pool[0].get("source", "live")
+            else:
+                pool = valid  # all mock → demo mode
+                source = "mock"
+
+            if category == "gainers":
+                pool = sorted(pool, key=lambda q: q["change_percent"], reverse=True)
+            elif category == "losers":
+                pool = sorted(pool, key=lambda q: q["change_percent"])
+            elif category == "active":
+                pool = sorted(pool, key=lambda q: q.get("volume") or 0, reverse=True)
+            else:  # trending → biggest absolute moves
+                pool = sorted(pool, key=lambda q: abs(q["change_percent"]), reverse=True)
+
+            rows = [{"symbol": q["symbol"], "name": q.get("name"),
+                     "price": q.get("price"), "change_percent": q.get("change_percent")}
+                    for q in pool[:6]]
 
         items = []
-        # enrich top items with quote + AI summary (bounded concurrency)
+        # enrich top items with quote + AI summary
         rows = rows[:6]
         quotes = await asyncio.gather(*[get_quote(r["symbol"]) for r in rows])
         for r, q in zip(rows, quotes):
@@ -108,12 +185,56 @@ async def get_movers(category: str) -> dict:
 
 
 # ----------------------------------------------------------------- sectors
+# Representative stocks per sector — used to compute live sector performance
+# (average of constituents' daily change) when FMP's sector endpoint is paid.
+SECTOR_CONSTITUENTS = {
+    "Technology": ["AAPL", "MSFT", "NVDA", "META", "GOOGL"],
+    "Banking": ["JPM", "BAC", "WFC", "GS"],
+    "Energy": ["XOM", "CVX", "COP"],
+    "Consumer Goods": ["KO", "PEP", "PG", "WMT"],
+    "Healthcare": ["PFE", "JNJ", "MRK"],
+    "Industrials": ["BA", "CAT", "GE"],
+}
+
+
 async def get_sectors() -> list[dict]:
     key = "sectors"
 
     async def factory():
+        # Nigeria-first: compute sector performance from NGX equities.
+        ngx_stocks = await ngx.all_stocks()
+        if ngx_stocks:
+            from collections import defaultdict
+            buckets = defaultdict(list)
+            for st in ngx_stocks:
+                sec = st.get("sector")
+                chg = st.get("change_percent")
+                if sec and chg is not None:
+                    buckets[sec].append(chg)
+            out = [{"sector": sec, "change_percent": round(sum(v) / len(v), 2)}
+                   for sec, v in buckets.items() if v]
+            if out:
+                return sorted(out, key=lambda x: x["change_percent"], reverse=True)
+
         s = await fmp.sectors()
-        return s or mock.mock_sectors()
+        if s:
+            return s
+        # Build live sector performance from constituent quotes.
+        out = []
+        any_live = False
+        for sector, syms in SECTOR_CONSTITUENTS.items():
+            quotes = await asyncio.gather(*[get_quote(x) for x in syms],
+                                          return_exceptions=True)
+            live = [q for q in quotes
+                    if isinstance(q, dict) and q.get("source") != "mock"
+                    and q.get("change_percent") is not None]
+            if live:
+                any_live = True
+                avg = sum(q["change_percent"] for q in live) / len(live)
+                out.append({"sector": sector, "change_percent": round(avg, 2)})
+        if any_live and out:
+            return sorted(out, key=lambda x: x["change_percent"], reverse=True)
+        return mock.mock_sectors()
 
     return await cache.get_or_set(key, factory, ttl=settings.CACHE_TTL_SECONDS * 5)
 
@@ -269,6 +390,88 @@ def _insight_from_sector(s: dict, bull: bool) -> dict:
         "confidence": conf,
         "related": _sector_symbols(sector),
     }
+
+
+# ----------------------------------------------------------------- chat context
+# Map common company names / aliases to tickers so we can detect them in questions.
+NAME_TO_SYMBOL = {
+    "apple": "AAPL", "tesla": "TSLA", "nvidia": "NVDA", "amazon": "AMZN",
+    "meta": "META", "facebook": "META", "netflix": "NFLX", "microsoft": "MSFT",
+    "google": "GOOGL", "alphabet": "GOOGL", "coinbase": "COIN", "ford": "F",
+    "gtco": "GTCO", "guaranty": "GTCO", "gtbank": "GTCO",
+    "zenith": "ZENITHBANK", "uba": "UBA", "access": "ACCESSCORP",
+    "mtn": "MTNN", "airtel": "AIRTELAFRI", "dangote cement": "DANGCEM",
+    "dangote sugar": "DANGSUGAR", "bua cement": "BUACEMENT", "bua foods": "BUAFOODS",
+    "seplat": "SEPLAT", "nestle": "NESTLE", "nigerian breweries": "NB",
+    "transcorp": "TRANSCORP", "geregu": "GEREGU", "aradel": "ARADEL",
+}
+
+
+def _detect_symbols(text: str) -> list[str]:
+    t = text.lower()
+    found = []
+    # name matches
+    for name, sym in NAME_TO_SYMBOL.items():
+        if name in t and sym not in found:
+            found.append(sym)
+    # explicit uppercase tickers in the original text
+    import re
+    for tok in re.findall(r"\b[A-Z]{2,10}\b", text):
+        if (ngx.is_ngx_symbol(tok) or tok in mock.COMPANY_NAMES) and tok not in found:
+            found.append(tok)
+    return found[:3]
+
+
+async def build_chat_context(message: str) -> tuple[str, list[str]]:
+    """Gather live data relevant to the user's question → (context_text, symbols)."""
+    m = message.lower()
+    parts: list[str] = []
+    symbols = _detect_symbols(message)
+
+    # Per-stock analysis
+    for sym in symbols:
+        try:
+            a = await analyze(sym)
+            q = a.get("quote") or {}
+            cur = "₦" if q.get("currency") == "NGN" else "$"
+            price = f"{cur}{q.get('price')}" if q.get("price") is not None else "n/a"
+            parts.append(
+                f"{a['symbol']} ({a.get('name')}): price {price}, "
+                f"change {q.get('change_percent')}% today, trend {a['trend']}, "
+                f"sentiment {a['sentiment']['label']} ({a['sentiment']['score']}/100), "
+                f"risk {a['risk_rating']}. {a['explanation']}"
+            )
+        except Exception:  # noqa: BLE001
+            continue
+
+    # Sector / "best performing" intent
+    if any(w in m for w in ("sector", "best perform", "performing", "industry")):
+        try:
+            sectors = await get_sectors()
+            top = sorted(sectors, key=lambda s: s["change_percent"], reverse=True)[:5]
+            parts.append("Sector performance today: " + ", ".join(
+                f"{s['sector']} {s['change_percent']:+.1f}%" for s in top))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Market mood / "why is the market up/down" intent
+    if any(w in m for w in ("market", "down", "up today", "mood", "today")) and not symbols:
+        try:
+            s = await get_market_sentiment()
+            parts.append(f"Overall market sentiment: {s['label']} ({s['score']}/100). {s['summary']}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Trending / attention intent
+    if any(w in m for w in ("trending", "attention", "most active", "hot", "popular")):
+        try:
+            tr = await get_movers("trending")
+            parts.append("Stocks getting attention today: " + ", ".join(
+                f"{i['symbol']} ({i['change_percent']:+.1f}%)" for i in tr["items"][:5]))
+        except Exception:  # noqa: BLE001
+            pass
+
+    return "\n".join(parts), symbols
 
 
 def _sector_symbols(sector: str) -> list[str]:
